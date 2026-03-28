@@ -22,7 +22,9 @@ public class DoublyLinkedList<T> {
         }
     }
 
-    private Node<T> head;
+    // volatile so that the lock-free fast path in ExpiringCounter.record() always
+    // sees the most recently written head without entering a synchronized block.
+    private volatile Node<T> head;
     private Node<T> tail;
 
     /** Returns the head (most-recently added) node, or {@code null} if the list is empty. */

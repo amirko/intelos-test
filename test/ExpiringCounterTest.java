@@ -11,21 +11,43 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * JUnit 5 tests for {@link ExpiringCounter}.
  *
- * <p>A {@link FakeClock} is used in all tests so that time is controlled
- * explicitly—no real-time waits are needed except where noted.
+ * <p>All tests that exercise expiry use {@link FakeClock} as both the
+ * {@link Clock} and the {@link Scheduler}.  When the test advances the clock
+ * via {@link FakeClock#setTime} or {@link FakeClock#advance}, any scheduled
+ * expiry callbacks whose trigger time has been reached are run immediately
+ * (in the test thread, outside all locks, to avoid deadlock with the
+ * {@code ExpiringCounter} monitor).
  */
 class ExpiringCounterTest {
 
     // -----------------------------------------------------------------------
-    // Fake clock used by all tests
+    // Fake clock / scheduler used by tests
     // -----------------------------------------------------------------------
 
     /**
-     * Deterministic clock backed by an {@link AtomicLong}.
-     * The time only changes when the test calls {@link #setTime} or {@link #advance}.
+     * Deterministic clock and scheduler backed by an {@link AtomicLong}.
+     *
+     * <p>Time only changes when the test calls {@link #setTime} or {@link #advance}.
+     * Callbacks registered via {@link #schedule} are fired synchronously in the
+     * test thread whenever the clock advances past their trigger time.
      */
-    static class FakeClock implements Clock {
+    static class FakeClock implements Clock, Scheduler {
+
         private final AtomicLong time;
+
+        /** Guards the {@code tasks} list only; never held while running callbacks. */
+        private final Object taskLock = new Object();
+        private final List<ScheduledTask> tasks = new ArrayList<>();
+
+        private static class ScheduledTask {
+            final long triggerTime;
+            final Runnable callback;
+
+            ScheduledTask(long triggerTime, Runnable callback) {
+                this.triggerTime = triggerTime;
+                this.callback = callback;
+            }
+        }
 
         FakeClock(long initialTime) {
             this.time = new AtomicLong(initialTime);
@@ -36,12 +58,44 @@ class ExpiringCounterTest {
             return time.get();
         }
 
+        /**
+         * Registers {@code callback} to be fired when the clock reaches
+         * {@code now() + delayMs}.
+         */
+        @Override
+        public void schedule(Runnable callback, long delayMs) {
+            synchronized (taskLock) {
+                tasks.add(new ScheduledTask(time.get() + delayMs, callback));
+            }
+        }
+
         void setTime(long t) {
             time.set(t);
+            runExpired(t);
         }
 
         void advance(long ms) {
-            time.addAndGet(ms);
+            long newTime = time.addAndGet(ms);
+            runExpired(newTime);
+        }
+
+        /**
+         * Collects all tasks whose trigger time ≤ {@code now} (under the task
+         * lock), then runs them <em>outside</em> the task lock to avoid
+         * deadlock with the {@code ExpiringCounter} monitor.
+         */
+        private void runExpired(long now) {
+            List<Runnable> toRun = new ArrayList<>();
+            synchronized (taskLock) {
+                tasks.removeIf(task -> {
+                    if (task.triggerTime <= now) {
+                        toRun.add(task.callback);
+                        return true;
+                    }
+                    return false;
+                });
+            }
+            toRun.forEach(Runnable::run);
         }
     }
 
@@ -63,7 +117,7 @@ class ExpiringCounterTest {
     @Test
     void simpleRecordingIncrementsCount() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(1000, clock);
+        ExpiringCounter counter = new ExpiringCounter(1000, clock, clock);
 
         counter.record();
         assertEquals(1, counter.getCount());
@@ -80,7 +134,7 @@ class ExpiringCounterTest {
     @Test
     void eventsExpireAfterWindow() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(1000, clock);
+        ExpiringCounter counter = new ExpiringCounter(1000, clock, clock);
 
         counter.record();           // event at t=0
         assertEquals(1, counter.getCount());
@@ -97,7 +151,7 @@ class ExpiringCounterTest {
     @Test
     void rollingWindowKeepsOnlyRecentEvents() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(1000, clock);
+        ExpiringCounter counter = new ExpiringCounter(1000, clock, clock);
 
         counter.record();           // t=0
         clock.setTime(500);
@@ -123,7 +177,7 @@ class ExpiringCounterTest {
     @Test
     void boundaryAtExactWindowEdge() {
         FakeClock clock = new FakeClock(100);
-        ExpiringCounter counter = new ExpiringCounter(500, clock);
+        ExpiringCounter counter = new ExpiringCounter(500, clock, clock);
 
         counter.record();           // event at t=100, expires at t=600
 
@@ -137,7 +191,7 @@ class ExpiringCounterTest {
     @Test
     void multipleEventsAtSameTimestampExpireAtOnce() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(1000, clock);
+        ExpiringCounter counter = new ExpiringCounter(1000, clock, clock);
 
         // All three events share the same bucket (t=0)
         counter.record();
@@ -180,7 +234,8 @@ class ExpiringCounterTest {
     @Test
     void concurrentRecordAndGetCountAreConsistent() throws InterruptedException {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(5000, clock);
+        // Large window so no expiry fires during the test.
+        ExpiringCounter counter = new ExpiringCounter(5000, clock, clock);
 
         int numThreads = 20;
         int recordsPerThread = 100;
@@ -223,12 +278,12 @@ class ExpiringCounterTest {
     @Test
     void windowMillisOneSingleThreaded() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(1, clock);
+        ExpiringCounter counter = new ExpiringCounter(1, clock, clock);
 
         counter.record();           // event at t=0, expires at t=1
         assertEquals(1, counter.getCount());
 
-        clock.setTime(1);           // expiry boundary
+        clock.setTime(1);           // expiry boundary – callback fires
         assertEquals(0, counter.getCount());
 
         // New event at t=1 is visible
@@ -245,9 +300,8 @@ class ExpiringCounterTest {
 
     @Test
     void windowMillisOneMultiThreaded() throws InterruptedException {
-        AtomicLong sharedTime = new AtomicLong(0);
-        Clock clock = sharedTime::get;
-        ExpiringCounter counter = new ExpiringCounter(1, clock);
+        FakeClock clock = new FakeClock(0);
+        ExpiringCounter counter = new ExpiringCounter(1, clock, clock);
 
         int numThreads = 10;
         CountDownLatch start = new CountDownLatch(1);
@@ -269,11 +323,11 @@ class ExpiringCounterTest {
         start.countDown();
         done.await();
 
-        // All threads recorded at t=0; counter should reflect numThreads events
+        // All threads recorded at t=0; counter should reflect numThreads events.
         assertEquals(numThreads, counter.getCount());
 
-        // Advance clock so all events expire
-        sharedTime.set(1);
+        // Advance clock so all events expire; FakeClock fires expiry callbacks.
+        clock.setTime(1);
         assertEquals(0, counter.getCount());
     }
 
@@ -284,7 +338,7 @@ class ExpiringCounterTest {
     @Test
     void nonConsecutiveEvents() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(1000, clock);
+        ExpiringCounter counter = new ExpiringCounter(1000, clock, clock);
 
         clock.setTime(1);
         counter.record();           // event at t=1, expires at t=1001
@@ -306,7 +360,7 @@ class ExpiringCounterTest {
     @Test
     void nonConsecutiveEventsLargeGap() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(100, clock);
+        ExpiringCounter counter = new ExpiringCounter(100, clock, clock);
 
         clock.setTime(10);
         counter.record();           // expires at t=110
@@ -328,7 +382,7 @@ class ExpiringCounterTest {
     @Test
     void expiredEventIsRemovedAndCountDecremented() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(1000, clock);
+        ExpiringCounter counter = new ExpiringCounter(1000, clock, clock);
 
         // Record multiple events in different buckets
         counter.record();           // t=0  → bucket 1 (numOfEvents=1)
@@ -355,7 +409,7 @@ class ExpiringCounterTest {
     @Test
     void expiredBucketWithMultipleEventsDecrementsCorrectly() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(1000, clock);
+        ExpiringCounter counter = new ExpiringCounter(1000, clock, clock);
 
         // Five events in the same bucket
         for (int i = 0; i < 5; i++) {
@@ -371,7 +425,7 @@ class ExpiringCounterTest {
     @Test
     void multipleExpiredBucketsRemovedAtOnce() {
         FakeClock clock = new FakeClock(0);
-        ExpiringCounter counter = new ExpiringCounter(500, clock);
+        ExpiringCounter counter = new ExpiringCounter(500, clock, clock);
 
         // Three buckets, each with multiple events
         clock.setTime(0);
@@ -399,10 +453,9 @@ class ExpiringCounterTest {
 
     @Test
     void concurrentRecordAndExpiryAreConsistent() throws InterruptedException {
-        AtomicLong sharedTime = new AtomicLong(0);
-        Clock clock = sharedTime::get;
+        FakeClock clock = new FakeClock(0);
         // Window of 100 ms
-        ExpiringCounter counter = new ExpiringCounter(100, clock);
+        ExpiringCounter counter = new ExpiringCounter(100, clock, clock);
 
         int rounds = 5;
         int threadsPerRound = 10;
@@ -410,7 +463,7 @@ class ExpiringCounterTest {
 
         for (int r = 0; r < rounds; r++) {
             final long base = r * 200L;
-            sharedTime.set(base);
+            clock.setTime(base);
 
             CountDownLatch start = new CountDownLatch(1);
             CountDownLatch done = new CountDownLatch(threadsPerRound);
@@ -437,17 +490,17 @@ class ExpiringCounterTest {
             done.await();
 
             // All events in this round were recorded at 'base', which is
-            // within the current window
+            // within the current window.
             int countInWindow = counter.getCount();
             assertTrue(countInWindow >= threadsPerRound * recordsPerThread,
                     "Should include current round's events; got " + countInWindow);
 
-            // Advance clock so all events in this round expire before next round
-            sharedTime.set(base + 100);
+            // Advance clock so all events in this round expire before next round.
+            clock.setTime(base + 100);
         }
 
-        // After all rounds, advance clock far enough so every event has expired
-        sharedTime.set(rounds * 200L + 100L);
+        // After all rounds, advance clock far enough so every event has expired.
+        clock.setTime(rounds * 200L + 100L);
         assertEquals(0, counter.getCount(), "All events should have expired");
     }
 }
