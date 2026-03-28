@@ -1,3 +1,9 @@
+**PHASE_1_START
+
+**PHASE_1_END - no use of AI for design, as requested
+
+**PHASE_2_START - this is the session with copilot for task implementation
+
 Creating Java project implementation as per design specifications
 You
 created the session
