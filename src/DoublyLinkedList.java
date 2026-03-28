@@ -1,5 +1,3 @@
-package com.intelos;
-
 /**
  * A generic doubly linked list.
  *

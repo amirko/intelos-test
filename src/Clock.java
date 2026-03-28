@@ -1,5 +1,3 @@
-package com.intelos;
-
 /**
  * Abstraction for the current time, enabling deterministic testing.
  */

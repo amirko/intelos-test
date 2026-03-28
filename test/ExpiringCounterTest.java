@@ -1,5 +1,3 @@
-package com.intelos;
-
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
